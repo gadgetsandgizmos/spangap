@@ -69,7 +69,8 @@ Commands (run inside a workspace):
                              MAJOR.MINOR.PATCH, e.g. 0.0.1): commit, tag with
                              its whole dependency tree, push; asks first.
                              --deps releases unreleased deps too; --dry-run
-                             shows the plan and stops
+                             shows the plan and stops; -m <text> gives the
+                             release text (otherwise an editor opens)
   publish-builds [cat]       publish a built catalogue (builds/<cat>/) as a
                              GitHub release tagged catalogue-<cat>; host-only,
                              same auth

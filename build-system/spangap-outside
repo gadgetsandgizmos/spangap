@@ -1361,25 +1361,25 @@ release_check() {
     local name=$1 repo=$2 branch
     branch=$(git -C "$repo" symbolic-ref --short -q HEAD || true)
     if [ "$branch" != main ]; then
-        printf '%-24s not on main (%s)\n' "$name" "${branch:-detached HEAD}"; return 1
+        printf '%-*s not on main (%s)\n' "${rel_w:-24}" "$name" "${branch:-detached HEAD}"; return 1
     fi
     if [ -n "$(git -C "$repo" status --porcelain)" ]; then
-        printf '%-24s has uncommitted changes\n' "$name"; return 1
+        printf '%-*s has uncommitted changes\n' "${rel_w:-24}" "$name"; return 1
     fi
     if ! git -C "$repo" fetch --quiet --tags origin; then
-        printf '%-24s fetch from origin failed\n' "$name"; return 1
+        printf '%-*s fetch from origin failed\n' "${rel_w:-24}" "$name"; return 1
     fi
     local ahead behind tags
     read -r behind ahead < <(git -C "$repo" rev-list --left-right --count origin/main...HEAD)
     if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
-        printf '%-24s diverged from GitHub: %s commit(s) ahead, %s behind\n' "$name" "$ahead" "$behind"; return 1
+        printf '%-*s diverged from GitHub: %s commit(s) ahead, %s behind\n' "${rel_w:-24}" "$name" "$ahead" "$behind"; return 1
     elif [ "$behind" -gt 0 ]; then
-        printf '%-24s %s commit(s) behind GitHub — to fix, run: spangap pull-all\n' "$name" "$behind"; return 1
+        printf '%-*s %s commit(s) behind GitHub — to fix, run: spangap pull-all\n' "${rel_w:-24}" "$name" "$behind"; return 1
     elif [ "$ahead" -gt 0 ]; then
         # Release tags on the unpushed commits, e.g. from a release whose push failed.
         tags=$(git -C "$repo" tag --list 'v*' --no-merged origin/main | release_versions | sed 's/^/v/' | paste -sd' ' -)
-        printf '%-24s %s commit(s) not on GitHub — to fix, run: git push --atomic origin main%s\n' \
-            "$name" "$ahead" "${tags:+ $tags}"; return 1
+        printf '%-*s %s commit(s) not on GitHub — to fix, run: git push --atomic origin main%s\n' \
+            "${rel_w:-24}" "$name" "$ahead" "${tags:+ $tags}"; return 1
     fi
 }
 
@@ -2839,14 +2839,18 @@ $inc"
     ;;
 release)
     shift
-    rel_version= rel_deps=0 rel_dry=0
+    rel_version= rel_deps=0 rel_dry=0 rel_text= rel_text_set=0
     while [ $# -gt 0 ]; do
         case $1 in
             --deps) rel_deps=1 ;;
             -n|--dry-run) rel_dry=1 ;;
+            -m|--message)
+                [ $# -ge 2 ] || die "$1 needs the release text (try --help)"
+                rel_text=$2 rel_text_set=1
+                shift ;;
             -h|--help)
                 printf '%s\n' \
-                    "usage: spangap release [--deps] [--dry-run] <version>" \
+                    "usage: spangap release [--deps] [--dry-run] [-m <text>] <version>" \
                     "  Release the straddle you're in as v<version> (MAJOR.MINOR.PATCH): set" \
                     "  version: in its straddle.yaml, commit, tag the commit with the version" \
                     "  and commit of every straddle in its full dependency tree, and push." \
@@ -2855,6 +2859,8 @@ release)
                     "  Unreleased straddles in a cycle with this one are released with it." \
                     "  --deps     release unreleased dependencies first, asking each version" \
                     "  --dry-run  show the plan and stop" \
+                    "  -m <text>  the release text, shown at the top of the release page (why" \
+                    "             this release, what it fixes); without -m an editor opens" \
                     "  Asks before committing, tagging or pushing anything."
                 exit 0 ;;
             -*) die "unknown option: $1 (try --help)" ;;
@@ -2863,7 +2869,7 @@ release)
         esac
         shift
     done
-    [ -n "$rel_version" ] || die "usage: spangap release [--deps] [--dry-run] <version>"
+    [ -n "$rel_version" ] || die "usage: spangap release [--deps] [--dry-run] [-m <text>] <version>"
     printf '%s\n' "$rel_version" | grep -Eq "$SEMVER_RE" \
         || die "'$rel_version' is not a MAJOR.MINOR.PATCH version"
     command -v git >/dev/null 2>&1 || die "git required on host PATH"
@@ -2897,8 +2903,11 @@ release)
         if [ "${r_dir[$i]}" = "$proj" ]; then self=$i; fi
     done
     [ -n "$self" ] || die "release-plan did not list $proj"
+    rel_w=24
+    for n in "${r_name[@]}"; do [ "${#n}" -lt "$rel_w" ] || rel_w=$(( ${#n} + 1 )); done
 
-    log "checking the ${#r_name[@]} straddles in ${r_name[$self]}'s tree"
+    if [ "${#r_name[@]}" -eq 1 ]; then rel_noun=straddle; else rel_noun=straddles; fi
+    log "checking the ${#r_name[@]} $rel_noun in ${r_name[$self]}'s tree"
     bad=0
     for i in "${!r_name[@]}"; do
         release_check "${r_name[$i]}" "${r_dir[$i]}" || bad=1
@@ -2924,7 +2933,7 @@ release)
         fi
     done
     if [ "${#held[@]}" -gt 0 ]; then
-        printf '%-24s not released (no release tag on its HEAD)\n' "${held[@]}"
+        for n in "${held[@]}"; do printf '%-*s not released (no release tag on its HEAD)\n' "$rel_w" "$n"; done
         die "nothing released — release the above first, or re-run with --deps"
     fi
 
@@ -2964,9 +2973,34 @@ release)
         else
             what="v${r_have[$i]}, already released"
         fi
-        printf '  %3s  %-28s %s\n' "${r_group[$i]}" "${r_name[$i]}" "$what"
+        printf '  %3s  %-*s %s\n' "${r_group[$i]}" "$(( rel_w + 4 ))" "${r_name[$i]}" "$what"
     done
     [ "$rel_dry" -eq 0 ] || exit 0
+
+    # The release text, for the straddle you're in only: from -m, else written
+    # in git's editor over a list of the commits since its last release.
+    if [ "$rel_text_set" -eq 0 ]; then
+        prev=$(release_latest "$proj")
+        draft=$(mktemp)
+        {
+            printf '\n# Release text for %s v%s: why this release, what it fixes or adds.\n' \
+                "${r_name[$self]}" "$rel_version"
+            printf '# It goes at the top of the GitHub release page. Lines starting with #\n'
+            printf '# are dropped; leave it empty for none.\n#\n'
+            if [ -n "$prev" ]; then printf '# Commits since v%s:\n' "$prev"; else printf '# Commits:\n'; fi
+            git -C "$proj" log --no-merges --format='#   %h %s' "${prev:+v$prev..}HEAD"
+        } > "$draft"
+        editor=$(git -C "$proj" var GIT_EDITOR) || die "no editor found; use -m <text>"
+        sh -c "$editor \"\$@\"" "$editor" "$draft" </dev/tty >/dev/tty \
+            || die "the editor failed; nothing released"
+        rel_text=$(grep -v '^#' "$draft" | sed '/./,$!d')
+        rm -f "$draft"
+    fi
+    if [ -n "$rel_text" ]; then
+        printf '\nrelease text for %s:\n%s\n' "${r_name[$self]}" "$(printf '%s\n' "$rel_text" | sed 's/^/  | /')"
+    else
+        printf '\nno release text for %s\n' "${r_name[$self]}"
+    fi
     read -r -p "commit, tag and push these releases? [y/N] " ans </dev/tty
     case $ans in y|Y|yes) ;; *) die "nothing released" ;; esac
 
@@ -2993,7 +3027,9 @@ release)
             msg=$(mktemp)
             sub=$(rel_plan "${r_dir[$i]}")
             {
-                printf '%s v%s\n\n```yaml\n' "${r_name[$i]}" "${r_new[$i]}"
+                printf '%s v%s\n\n' "${r_name[$i]}" "${r_new[$i]}"
+                if [ "$i" = "$self" ] && [ -n "$rel_text" ]; then printf '%s\n\n' "$rel_text"; fi
+                printf '```yaml\n'
                 printf 'straddle: %s\nversion: %s\ndependencies:\n' "${r_name[$i]}" "${r_new[$i]}"
                 while read -r _ n d _; do
                     [ "$workspace/$d" != "${r_dir[$i]}" ] || continue
@@ -3009,7 +3045,7 @@ release)
         for i in "${members[@]}"; do
             git -C "${r_dir[$i]}" push --quiet --atomic origin main "v${r_new[$i]}" \
                 || die "${r_name[$i]}: push failed; its release commit and tag are only local — push them (git push --atomic origin main v${r_new[$i]}) and re-run"
-            printf '%-24s released v%s\n' "${r_name[$i]}" "${r_new[$i]}"
+            printf '%-*s released v%s\n' "$rel_w" "${r_name[$i]}" "${r_new[$i]}"
         done
     done
     exit 0
