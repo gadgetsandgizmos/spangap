@@ -1,0 +1,60 @@
+name: release
+
+# Makes a repo's GitHub release page when spangap release pushes a vX.Y.Z tag.
+# Each repo has a short .github/workflows/release.yml that points here, so this
+# runs for whichever repo got the tag.
+on:
+  workflow_call:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create the release page
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          versions() { sed -n 's/^v//p' | { grep -E "$re" || true; } | sort -t. -k1,1n -k2,2n -k3,3n; }
+          deps() {
+              git tag -l --format='%(contents)' "$1" |
+                  awk '/^  - name: /{n=$3} /^    version: /{print n, $2}' | sort
+          }
+
+          if ! printf '%s\n' "${TAG#v}" | grep -Eq "$re"; then
+              echo "$TAG is not a release tag"; exit 0
+          fi
+          # checkout leaves the pushed tag lightweight; fetch it whole for its message.
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          prev=$(git tag --list 'v*' --merged "$TAG^" | versions | tail -n 1)
+
+          {
+              git tag -l --format='%(contents)' "$TAG"
+              if [ -n "$prev" ]; then
+                  changes=$(join -a 1 -a 2 -e - -o 0,1.2,2.2 <(deps "v$prev") <(deps "$TAG") |
+                  while read -r n old new; do
+                      if [ "$old" = "$new" ]; then continue
+                      elif [ "$old" = - ]; then echo "- $n v$new (new)"
+                      elif [ "$new" = - ]; then echo "- $n (dropped, was v$old)"
+                      else echo "- $n v$old → v$new ([commits](https://github.com/$n/compare/v$old...v$new))"
+                      fi
+                  done)
+                  if [ -n "$changes" ]; then
+                      printf '\n## Dependency changes since v%s\n\n%s\n' "$prev" "$changes"
+                  else
+                      printf '\nNo dependency changes since v%s\n' "$prev"
+                  fi
+                  printf '\n## Commits since v%s\n\n' "$prev"
+                  git log --no-merges --format='- %h %s' "v$prev..$TAG"
+              else
+                  printf '\n## Commits\n\n'
+                  git log --no-merges --format='- %h %s' "$TAG"
+              fi
+          } > notes.md
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag

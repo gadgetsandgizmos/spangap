@@ -5105,6 +5105,75 @@ def cmd_list_requires(args: argparse.Namespace) -> int:
     return 0
 
 
+def _release_edges(m: Manifest, names: set[str]) -> set[str]:
+    """What m depends on within the resolved tree: its requires:, its
+    additional_installs: whose when: gate is in the tree, and spangap-core."""
+    out = {_bare(s) for s in m.requires}
+    out |= {_bare(s) for s, when in m.additional_installs_gated
+            if when is None or _bare(when) in names}
+    if m.name != CORE_NAME:
+        out.add(CORE_NAME)
+    return (out & names) - {m.name}
+
+
+def _release_groups(edges: dict[str, set[str]], root: str) -> list[list[str]]:
+    """The strongly-connected components of the tree (Tarjan), from root. Each
+    comes out after every component it depends on, which is the order they
+    have to be released in; root's own comes out last."""
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    groups: list[list[str]] = []
+
+    def visit(n: str) -> None:
+        index[n] = low[n] = len(index)
+        stack.append(n)
+        on_stack.add(n)
+        for d in sorted(edges[n]):
+            if d not in index:
+                visit(d)
+                low[n] = min(low[n], low[d])
+            elif d in on_stack:
+                low[n] = min(low[n], index[d])
+        if low[n] == index[n]:
+            group: list[str] = []
+            while True:
+                d = stack.pop()
+                on_stack.discard(d)
+                group.append(d)
+                if d == n:
+                    break
+            groups.append(sorted(group))
+
+    visit(root)
+    return groups
+
+
+def cmd_release_plan(args: argparse.Namespace) -> int:
+    """Print the project's full dependency tree in release order.
+
+    One line per straddle, the project included: `<group> <org/repo> <dir>
+    <version>`, dir relative to the workspace. A group is a cycle (straddles
+    that reach each other through requires: or additional_installs:), released
+    together; a straddle in no cycle is a group of its own. Groups are numbered
+    in the order they have to be released, the project's own last. Parsed by
+    host-side `spangap release` in spangap-outside.
+    """
+    proj = find_project()
+    deps, missing = resolve_requires(proj, scan_workspace_straddles(), missing_ok=True)
+    if missing:
+        die("not in the workspace: " + ", ".join(missing) + "\n"
+            "       Run `spangap get-deps` first, so the release records the whole tree.")
+    nodes = {m.name: m for m in [*deps, proj]}
+    edges = {n: _release_edges(m, set(nodes)) for n, m in nodes.items()}
+    for i, group in enumerate(_release_groups(edges, proj.name), 1):
+        for n in group:
+            m = nodes[n]
+            print(i, n, m.dir.relative_to(WORKSPACE), m.version)
+    return 0
+
+
 def _monitor_ready(timeout: float = 4.0) -> bool:
     """Probe for a host-side `spangap monitor` via the .spangap-ping handshake.
 
@@ -6803,6 +6872,11 @@ def main(argv: list[str] | None = None) -> int:
         "list-requires",
         help="print the project's full transitive requires set, in dependency order (read-only diagnostic)",
     ).set_defaults(func=cmd_list_requires)
+
+    sub.add_parser(
+        "release-plan",
+        help="print the project's full dependency tree in release order, cycles grouped (used by host-side `spangap release`)",
+    ).set_defaults(func=cmd_release_plan)
 
     args = p.parse_args(argv)
     # Faithful `spangap build ...` command line, baked into the image by

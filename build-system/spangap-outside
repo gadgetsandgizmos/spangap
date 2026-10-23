@@ -1330,6 +1330,59 @@ fast_forward_repo() {
     return 1
 }
 
+# A release tag is v<MAJOR>.<MINOR>.<PATCH> and nothing else; any other tag
+# (e.g. flashmon's catalogue-*) is never read as a version.
+SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+# release_versions: the release versions among the tag names on stdin, without
+# the v, lowest first.
+release_versions() {
+    sed -n 's/^v//p' | { grep -E "$SEMVER_RE" || true; } | sort -t. -k1,1n -k2,2n -k3,3n
+}
+
+# release_latest REPO: REPO's highest release version, or nothing.
+release_latest() { git -C "$1" tag --list 'v*' | release_versions | tail -n 1; }
+
+# release_at_head REPO: the release version tagged on REPO's HEAD, or nothing.
+release_at_head() { git -C "$1" tag --list 'v*' --points-at HEAD | release_versions | tail -n 1; }
+
+# release_newer A B: whether version A is higher than version B (none counts
+# as lower than anything).
+release_newer() {
+    [ -z "$2" ] && return 0
+    [ "$1" != "$2" ] &&
+        [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)" = "$1" ]
+}
+
+# release_check NAME REPO: whether REPO can be released or named in a release:
+# on main, clean, and the same commit as GitHub's main, so a release never
+# names a commit that is only on this machine. Says why not.
+release_check() {
+    local name=$1 repo=$2 branch
+    branch=$(git -C "$repo" symbolic-ref --short -q HEAD || true)
+    if [ "$branch" != main ]; then
+        printf '%-24s not on main (%s)\n' "$name" "${branch:-detached HEAD}"; return 1
+    fi
+    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+        printf '%-24s has uncommitted changes\n' "$name"; return 1
+    fi
+    if ! git -C "$repo" fetch --quiet --tags origin; then
+        printf '%-24s fetch from origin failed\n' "$name"; return 1
+    fi
+    local ahead behind tags
+    read -r behind ahead < <(git -C "$repo" rev-list --left-right --count origin/main...HEAD)
+    if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+        printf '%-24s diverged from GitHub: %s commit(s) ahead, %s behind\n' "$name" "$ahead" "$behind"; return 1
+    elif [ "$behind" -gt 0 ]; then
+        printf '%-24s %s commit(s) behind GitHub — to fix, run: spangap pull-all\n' "$name" "$behind"; return 1
+    elif [ "$ahead" -gt 0 ]; then
+        # Release tags on the unpushed commits, e.g. from a release whose push failed.
+        tags=$(git -C "$repo" tag --list 'v*' --no-merged origin/main | release_versions | sed 's/^/v/' | paste -sd' ' -)
+        printf '%-24s %s commit(s) not on GitHub — to fix, run: git push --atomic origin main%s\n' \
+            "$name" "$ahead" "${tags:+ $tags}"; return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Command dispatch (outside).
 # ---------------------------------------------------------------------------
@@ -2782,6 +2835,183 @@ $inc"
     # there. Best-effort; the next `spangap build` heals too.
     [ -n "${container:-}" ] && docker exec -e SPANGAP_WORKSPACE="$container_ws" "$container" spangap heal || true
     log "get-deps done — all requires: present"
+    exit 0
+    ;;
+release)
+    shift
+    rel_version= rel_deps=0 rel_dry=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --deps) rel_deps=1 ;;
+            -n|--dry-run) rel_dry=1 ;;
+            -h|--help)
+                printf '%s\n' \
+                    "usage: spangap release [--deps] [--dry-run] <version>" \
+                    "  Release the straddle you're in as v<version> (MAJOR.MINOR.PATCH): set" \
+                    "  version: in its straddle.yaml, commit, tag the commit with the version" \
+                    "  and commit of every straddle in its full dependency tree, and push." \
+                    "  Every straddle in the tree must be on main, clean and level with GitHub," \
+                    "  and every dependency already released (a release tag on its HEAD)." \
+                    "  Unreleased straddles in a cycle with this one are released with it." \
+                    "  --deps     release unreleased dependencies first, asking each version" \
+                    "  --dry-run  show the plan and stop" \
+                    "  Asks before committing, tagging or pushing anything."
+                exit 0 ;;
+            -*) die "unknown option: $1 (try --help)" ;;
+            *)  [ -z "$rel_version" ] || die "one version only (try --help)"
+                rel_version=${1#v} ;;
+        esac
+        shift
+    done
+    [ -n "$rel_version" ] || die "usage: spangap release [--deps] [--dry-run] <version>"
+    printf '%s\n' "$rel_version" | grep -Eq "$SEMVER_RE" \
+        || die "'$rel_version' is not a MAJOR.MINOR.PATCH version"
+    command -v git >/dev/null 2>&1 || die "git required on host PATH"
+    proj=$(require_straddle release)
+
+    # rel_plan DIR: the release-plan of the straddle in DIR.
+    rel_plan() {
+        docker exec -e SPANGAP_WORKSPACE="$container_ws" --workdir "$(host_to_container "$1")" \
+            "$container" spangap release-plan \
+            || die "spangap release-plan failed in container $container (see error above)"
+    }
+    # rel_index NAME: NAME's index in the r_* arrays.
+    rel_index() {
+        local i
+        for i in "${!r_name[@]}"; do
+            if [ "${r_name[$i]}" = "$1" ]; then printf '%s\n' "$i"; return 0; fi
+        done
+        die "$1 is not in ${r_name[$self]}'s tree"
+    }
+
+    # The tree in release order, as parallel arrays. r_have is the release
+    # already on a straddle's HEAD; r_new the one this run makes ("?" until
+    # its version is asked).
+    r_group=() r_name=() r_dir=() r_have=() r_new=()
+    plan=$(rel_plan "$proj")
+    while read -r g n d _; do
+        r_group+=("$g"); r_name+=("$n"); r_dir+=("$workspace/$d")
+    done <<< "$plan"
+    self=
+    for i in "${!r_name[@]}"; do
+        if [ "${r_dir[$i]}" = "$proj" ]; then self=$i; fi
+    done
+    [ -n "$self" ] || die "release-plan did not list $proj"
+
+    log "checking the ${#r_name[@]} straddles in ${r_name[$self]}'s tree"
+    bad=0
+    for i in "${!r_name[@]}"; do
+        release_check "${r_name[$i]}" "${r_dir[$i]}" || bad=1
+    done
+    [ "$bad" -eq 0 ] || die "nothing released — fix the above first"
+
+    held=()
+    for i in "${!r_name[@]}"; do
+        r_have[$i]=$(release_at_head "${r_dir[$i]}")
+        r_new[$i]=
+        if [ -n "${r_have[$i]}" ] &&
+           ! git -C "${r_dir[$i]}" ls-remote --exit-code --tags origin "refs/tags/v${r_have[$i]}" >/dev/null 2>&1; then
+            die "${r_name[$i]}: v${r_have[$i]} is tagged here but not on GitHub — push it (git push origin v${r_have[$i]}) or delete it"
+        fi
+        if [ "$i" = "$self" ]; then
+            r_new[$i]=$rel_version
+        elif [ -z "${r_have[$i]}" ]; then
+            if [ "${r_group[$i]}" = "${r_group[$self]}" ] || [ "$rel_deps" -eq 1 ]; then
+                r_new[$i]="?"
+            else
+                held+=("${r_name[$i]}")
+            fi
+        fi
+    done
+    if [ "${#held[@]}" -gt 0 ]; then
+        printf '%-24s not released (no release tag on its HEAD)\n' "${held[@]}"
+        die "nothing released — release the above first, or re-run with --deps"
+    fi
+
+    latest=$(release_latest "$proj")
+    release_newer "$rel_version" "$latest" \
+        || die "v$rel_version is not higher than ${r_name[$self]}'s last release, v$latest"
+    if [ "$rel_dry" -eq 0 ]; then
+        for i in "${!r_name[@]}"; do
+            [ "${r_new[$i]}" = "?" ] || continue
+            latest=$(release_latest "${r_dir[$i]}")
+            if [ -n "$latest" ]; then
+                suggest=${latest%.*}.$(( ${latest##*.} + 1 ))
+            else
+                suggest=0.0.1
+            fi
+            while :; do
+                read -r -p "version for ${r_name[$i]} (last: ${latest:-none}) [$suggest]: " v </dev/tty
+                v=${v:-$suggest}; v=${v#v}
+                if ! printf '%s\n' "$v" | grep -Eq "$SEMVER_RE"; then
+                    echo "  not a MAJOR.MINOR.PATCH version"
+                elif ! release_newer "$v" "$latest"; then
+                    echo "  must be higher than v$latest"
+                else
+                    break
+                fi
+            done
+            r_new[$i]=$v
+        done
+    fi
+
+    printf '\nrelease plan, in order (a shared number is a cycle, released together):\n'
+    for i in "${!r_name[@]}"; do
+        if [ "${r_new[$i]}" = "?" ]; then
+            what="release (version asked)"
+        elif [ -n "${r_new[$i]}" ]; then
+            what="release v${r_new[$i]}"
+        else
+            what="v${r_have[$i]}, already released"
+        fi
+        printf '  %3s  %-28s %s\n' "${r_group[$i]}" "${r_name[$i]}" "$what"
+    done
+    [ "$rel_dry" -eq 0 ] || exit 0
+    read -r -p "commit, tag and push these releases? [y/N] " ans </dev/tty
+    case $ans in y|Y|yes) ;; *) die "nothing released" ;; esac
+
+    # Group by group, dependencies first: every member's version commit, then
+    # every member's tag (a member's manifest names its cycle-mates' release
+    # commits), then the pushes, so GitHub never has a release whose
+    # dependencies it lacks.
+    last=$(( ${#r_name[@]} - 1 ))
+    for (( g = 1; g <= r_group[last]; g++ )); do
+        members=()
+        for i in "${!r_name[@]}"; do
+            if [ "${r_group[$i]}" = "$g" ] && [ -n "${r_new[$i]}" ]; then members+=("$i"); fi
+        done
+        [ "${#members[@]}" -gt 0 ] || continue
+        for i in "${members[@]}"; do
+            f=${r_dir[$i]}/straddle.yaml
+            sed -E "s/^version:.*/version: ${r_new[$i]}/" "$f" > "$f.release"
+            cat "$f.release" > "$f"; rm -f "$f.release"
+            if ! git -C "${r_dir[$i]}" diff --quiet -- straddle.yaml; then
+                git -C "${r_dir[$i]}" commit --quiet --signoff -m "release v${r_new[$i]}" -- straddle.yaml
+            fi
+        done
+        for i in "${members[@]}"; do
+            msg=$(mktemp)
+            sub=$(rel_plan "${r_dir[$i]}")
+            {
+                printf '%s v%s\n\n```yaml\n' "${r_name[$i]}" "${r_new[$i]}"
+                printf 'straddle: %s\nversion: %s\ndependencies:\n' "${r_name[$i]}" "${r_new[$i]}"
+                while read -r _ n d _; do
+                    [ "$workspace/$d" != "${r_dir[$i]}" ] || continue
+                    j=$(rel_index "$n")
+                    printf '  - name: %s\n    version: %s\n    commit: %s\n' \
+                        "$n" "${r_new[$j]:-${r_have[$j]}}" "$(git -C "${r_dir[$j]}" rev-parse HEAD)"
+                done <<< "$sub"
+                printf '```\n'
+            } > "$msg"
+            git -C "${r_dir[$i]}" tag --annotate --file "$msg" "v${r_new[$i]}"
+            rm -f "$msg"
+        done
+        for i in "${members[@]}"; do
+            git -C "${r_dir[$i]}" push --quiet --atomic origin main "v${r_new[$i]}" \
+                || die "${r_name[$i]}: push failed; its release commit and tag are only local — push them (git push --atomic origin main v${r_new[$i]}) and re-run"
+            printf '%-24s released v%s\n' "${r_name[$i]}" "${r_new[$i]}"
+        done
+    done
     exit 0
     ;;
 detect-build)

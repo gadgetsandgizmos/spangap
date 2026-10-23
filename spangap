@@ -65,6 +65,11 @@ Commands (run inside a workspace):
                              workspace) from GitHub; host-only, same auth. Repos
                              that diverged or carry local changes are reported,
                              not touched
+  release [opts] <ver>       release the current straddle as v<ver> (<ver> is
+                             MAJOR.MINOR.PATCH, e.g. 0.0.1): commit, tag with
+                             its whole dependency tree, push; asks first.
+                             --deps releases unreleased deps too; --dry-run
+                             shows the plan and stops
   publish-builds [cat]       publish a built catalogue (builds/<cat>/) as a
                              GitHub release tagged catalogue-<cat>; host-only,
                              same auth
